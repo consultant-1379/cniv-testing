@@ -1,0 +1,206 @@
+def commonMethods
+
+pipeline{
+    agent {
+            node
+            {
+               label slave
+            }
+        }
+    options {
+        timeout(time: 2.5, unit: 'HOURS')
+    }
+    environment {
+        HOME_DIR = "${WORKSPACE}"
+        cenm_utilities_docker_image = "armdocker.rnd.ericsson.se/proj-enm/cenm-build-utilities:latest"
+        nexus_repositoryUrl = "https://arm1s11-eiffel004.eiffel.gic.ericsson.se:8443/nexus/content/repositories/cniv-releases"
+        csar_package_name = "enm-cniv-installation-package"
+        OQS_URL="https://atvoqs.athtem.eei.ericsson.se/api/deployments"
+    }
+    stages{
+        stage('Clean Up WorkSpace'){
+                steps{
+                        deleteDir()
+                     }
+        }
+        stage('Checkout Integration Pipeline Git Repository') {
+            steps {
+                git branch: 'master',
+                        url: 'ssh://gerrit.ericsson.se:29418/DETES/com.ericsson.de.stsoss/cniv-testing'
+                sh '''
+                    git remote set-url origin --push ssh://gerrit.ericsson.se:29418/DETES/com.ericsson.de.stsoss/cniv-testing
+                '''
+         }
+        }
+        stage('Inject Credential Files') {
+            steps {
+                withCredentials([file(credentialsId: 'lciadm100-docker-auth', variable: 'dockerConfig')]) {
+                    sh "install -m 600 ${dockerConfig} ${WORKSPACE}/config.json"
+                }
+            }
+        }
+        stage('Load common methods') {
+            steps {
+                script {
+                    commonMethods = load("${env.WORKSPACE}/Jenkins/JobDSL/CommonMethods.groovy")
+                }
+            }
+        }
+        stage( 'setup_kubeconfig_file_for_cluster' ) {
+            steps {
+                script{
+                      commonMethods.extract_jq()
+                      commonMethods.download_kube_config_file_from_dit()
+                      commonMethods.read_site_config_info_from_dit()
+                      commonMethods.set_kube_config_file()
+               }
+            }
+        }
+        stage('Clean CSAR folder and delete and pull utilities image in client machine'){
+              steps{
+                  script{
+                        commonMethods.client_cleancsar()
+                        commonMethods.delete_and_pull_utilitiesimage_clientmachine()
+                        }
+                    }
+             }
+        stage( 'Login docker registry' ) {
+            steps {
+               script{
+                   if ((env.CONTAINER_REGISTRY_USERNAME != '' && env.CONTAINER_REGISTRY_PASSWORD != '')){
+                       commonMethods.create_docker_secret()
+                   }
+                   else{
+                       echo "All the required details are not provided to execute login docker registry"
+                       sh "exit 1"
+                   }
+              }
+            }
+        }
+        stage( 'Download CSAR PACKAGE from nexus area' ) {
+            steps {
+              script{
+                retry(3){
+                  commonMethods.download_csar_package_nexus()
+                }
+              }
+            }
+        }
+        stage('Extract csar package') {
+            steps {
+                script {
+                       commonMethods.extract_csar_package()
+                }
+            }
+        }
+        stage('Perform Load/Retag/Push') {
+            steps {
+                script {
+                  commonMethods.csar_utils()
+                }
+            }
+        }
+        stage('Updating integration values'){
+            steps{
+                script{
+                    commonMethods.client_integrationvaluepath()
+                    commonMethods.updateIntegrationValues()
+                    commonMethods.client_pushfile()
+                    }
+            }
+        }
+        stage('Delete Old CNIV Deployment'){
+            steps{
+                script{
+                       commonMethods.cniv_uninstall()
+                }
+            }
+        }
+        stage('CNIV Install'){
+             stages {
+                   stage('Install CNIV Integration chart'){
+                    steps{
+                       script{
+                             commonMethods.start_time_deployment()
+                             commonMethods.cniv_integration_chart("install","2h")
+                             commonMethods.end_time_deployment()
+                      }
+                    }
+                  }
+                }
+        }
+        stage('check all the pods up and running'){
+            steps{
+               script{
+                      commonMethods.checking_error_pods()
+               }
+            }
+        }
+        stage('check status of the containers of running pods'){
+            steps{
+               script{
+                 retry(20){
+                     commonMethods.checkrunningpods()
+                 }
+               }
+            }
+        }
+
+        stage('CheckPods Running'){
+            steps{
+                script{
+                    retry(10){
+                        commonMethods.checkHealthyPods()
+                    }
+                }
+            }
+        }
+
+        stage('Download Report'){
+            steps{
+                script{
+                    commonMethods.cnivReport()
+                    }
+                }
+            }
+        }
+        stage('Generate artifact file'){
+             steps{
+                  script{
+                        commonMethods.generate_artifact_file()
+                        }
+                  }
+                }
+    post{
+        failure {
+            script{
+                   echo "Failure"
+                      def report = commonMethods.reportHeading("Failed")
+                      report += commonMethods.printPods()
+                      commonMethods.emailReport(report)
+            }
+        }
+        aborted{
+            script{
+                echo "Aborted"
+                def report = commonMethods.reportHeading("Aborted")
+                report += commonMethods.printPods()
+                commonMethods.emailReport(report)
+            }
+        }
+        success{
+            script{
+                  echo "Success"
+                  def report = commonMethods.reportHeading("Success")
+                  report +=commonMethods.printPods()
+                  commonMethods.emailReport(report)
+            }
+        }
+        always {
+            script{
+                currentBuild.displayName = "Install with CSAR version ${csar_package_version} on: ${environment_name}"
+                currentBuild.description = "Installing CNIV using ${csar_package_name}-${csar_package_version}.csar"
+            }
+        }
+    }
+}
